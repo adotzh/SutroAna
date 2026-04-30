@@ -3,12 +3,12 @@
 Read-only progress dashboard for a SutroAna optimization run.
 
 Usage:
-    python3 monitor.py <problem-path>            # one-shot snapshot
-    python3 monitor.py <problem-path> --watch    # refresh every 10s
-    python3 monitor.py --list [--root <dir>]     # list all problems
+    python3 monitor.py <problem-path>             # one-shot snapshot
+    python3 monitor.py <problem-path> --watch     # refresh every 10s
+    python3 monitor.py --list [--root <dir>]      # list all problems
 """
 
-import json, re, time, argparse, math
+import json, re, time, argparse
 from pathlib import Path
 from datetime import datetime
 
@@ -17,28 +17,68 @@ def resolve(p: str) -> Path:
     return Path(p).expanduser().resolve()
 
 
-def load(problem_dir: Path) -> tuple[dict, dict]:
-    cfg   = json.loads((problem_dir / "problem.json").read_text())
-    state = json.loads((problem_dir / "directions.json").read_text())
-    return cfg, state
+def load_cfg(problem_dir: Path) -> dict:
+    defaults = {
+        "max_lanes": 2,
+        "baseline": None,
+        "plateau_sensitivity": 0.2,
+        "token_budget": None,
+        "record_lower_is_better": True,
+        "stall_minutes": 15,
+        "stall_min_files": 3,
+        "record_glob": "records/record_*.ir",
+        "record_cost_pattern": "record_(\\d+)",
+        "experiment_glob": "exp_*.py",
+    }
+    cfg_path = problem_dir / "problem.json"
+    if cfg_path.exists():
+        defaults.update(json.loads(cfg_path.read_text()))
+    return defaults
+
+
+def load_state(problem_dir: Path) -> dict:
+    p = problem_dir / "directions.json"
+    if not p.exists():
+        return {"record": None, "lanes": [], "improvement_history": [], "directions": []}
+    return json.loads(p.read_text())
 
 
 def scan_records(problem_dir: Path, cfg: dict) -> list[dict]:
-    pat = re.compile(cfg["record_cost_pattern"])
-    records = []
-    for p in problem_dir.glob(cfg.get("record_glob", "records/record_*.ir")):
+    pat      = re.compile(cfg["record_cost_pattern"])
+    lane_pat = re.compile(r"_lane(\d+)")
+    records  = []
+    for p in problem_dir.glob(cfg["record_glob"]):
         m = pat.search(p.name)
-        if m:
-            records.append({"cost": int(m.group(1)), "mtime": p.stat().st_mtime,
-                            "name": p.name})
+        if not m:
+            continue
+        lm   = lane_pat.search(p.name)
+        lane = int(lm.group(1)) if lm else None
+        records.append({"cost": int(m.group(1)), "mtime": p.stat().st_mtime,
+                        "name": p.name, "lane": lane})
     return sorted(records, key=lambda r: r["mtime"])
 
 
 def scan_experiments(problem_dir: Path, cfg: dict) -> list[dict]:
     exps = []
-    for p in problem_dir.glob(cfg.get("experiment_glob", "exp_*.py")):
-        exps.append({"name": p.stem, "mtime": p.stat().st_mtime, "size": p.stat().st_size})
+    for p in problem_dir.glob(cfg["experiment_glob"]):
+        m    = re.match(r"exp_(\d+)_", p.stem)
+        lane = int(m.group(1)) if m else None
+        exps.append({"name": p.stem, "mtime": p.stat().st_mtime,
+                     "size": p.stat().st_size, "lane": lane})
     return sorted(exps, key=lambda e: e["mtime"])
+
+
+def read_tokens(problem_dir: Path) -> int:
+    log = problem_dir / "token_log.jsonl"
+    if not log.exists():
+        return 0
+    total = 0
+    for line in log.read_text().splitlines():
+        try:
+            total += json.loads(line.strip()).get("tokens", 0)
+        except Exception:
+            pass
+    return total
 
 
 def fmt_time(ts: float) -> str:
@@ -46,7 +86,16 @@ def fmt_time(ts: float) -> str:
 
 
 def fmt_delta(secs: float) -> str:
-    return f"{secs:.0f}s" if secs < 60 else f"{secs/60:.1f}m"
+    if secs < 60:
+        return f"{secs:.0f}s"
+    if secs < 3600:
+        return f"{secs/60:.1f}m"
+    return f"{secs/3600:.1f}h"
+
+
+def plateau_bar(score: float, width: int = 16) -> str:
+    filled = int(round(min(score, 1.0) * width))
+    return "█" * filled + "·" * (width - filled)
 
 
 def render(problem_dir: Path, cfg: dict, state: dict,
@@ -55,87 +104,134 @@ def render(problem_dir: Path, cfg: dict, state: dict,
     lower    = cfg.get("record_lower_is_better", True)
     baseline = cfg.get("baseline")
     record   = state.get("record")
-    done     = sum(1 for d in state["directions"] if d["status"] == "done")
-    active   = sum(1 for d in state["directions"] if d["status"] == "active")
-    pending  = sum(1 for d in state["directions"] if d["status"] == "pending")
+    history  = state.get("improvement_history", [])
+    lanes    = state.get("lanes", [])
+    dirs     = state.get("directions", [])
 
-    stop_signal = problem_dir / "STOP_SIGNAL"
+    done_dirs    = [d for d in dirs if d["status"] == "done"]
+    active_dirs  = [d for d in dirs if d["status"] == "active"]
+    pending_dirs = [d for d in dirs if d["status"] == "pending"]
+
+    # Plateau score
+    plateau_score = 1.0
+    if len(history) >= 3:
+        h = sorted(history, key=lambda x: x["ts"])
+        rates = []
+        for i in range(1, len(h)):
+            dt = max((h[i]["ts"] - h[i-1]["ts"]) / 60, 0.1)
+            dc = h[i-1]["cost"] - h[i]["cost"]
+            rates.append(dc / dt)
+        if len(rates) >= 2 and rates[:-1]:
+            avg = sum(rates[:-1]) / len(rates[:-1])
+            plateau_score = (rates[-1] / avg) if avg > 0 else 0.0
+
+    tokens_used  = read_tokens(problem_dir)
+    token_budget = cfg.get("token_budget")
 
     print("\033[2J\033[H", end="")
-    print("=" * 68)
-    print(f"  {cfg['name'].upper()}  ·  {cfg.get('description','')}")
+    print("=" * 70)
+    print(f"  {cfg.get('name', problem_dir.name).upper()}  ·  {cfg.get('description','')[:44]}")
     print(f"  {datetime.now().strftime('%H:%M:%S')}  "
           f"Record: {record or '—'}  Baseline: {baseline or '—'}  "
-          f"Dirs: {done}✅ {active}🔄 {pending}⬜")
-    print("=" * 68)
+          f"Dirs: {len(done_dirs)}✅ {len(active_dirs)}🔄 {len(pending_dirs)}⬜")
+    print("=" * 70)
+
+    # Lanes
+    if lanes:
+        print("\n  LANES")
+        for lane in lanes:
+            lid    = lane["id"]
+            status = lane.get("status", "?")
+            dname  = next((d["name"] for d in dirs
+                           if d["id"] == lane.get("direction_id")), "—")
+            sig    = problem_dir / f"STOP_SIGNAL_{lid}"
+            flag   = "⛔ STOP_SIGNAL" if sig.exists() else ""
+            lane_recs  = [r for r in records if r["lane"] == lid]
+            last_score = lane_recs[-1]["cost"] if lane_recs else "—"
+            icon   = {"active": "🔄", "idle": "💤", "done": "✅"}.get(status, "?")
+            print(f"  {icon} Lane {lid}  {dname:<36} best={last_score}  {flag}")
 
     # Direction queue
     print("\n  DIRECTIONS")
-    for d in state["directions"]:
+    for d in dirs:
         icon  = {"pending": "⬜", "active": "🔄", "done": "✅"}.get(d["status"], "?")
         score = f"{d['best_score']:,}" if d.get("best_score") else "—"
         print(f"  {icon}  {d['name']:<46}  {score:>10}")
 
-    # Record timeline
-    if records and baseline:
-        print("\n  RECORD TIMELINE")
-        print(f"  {'Time':>8}  {'Score':>9}  {'vs base':>9}  {'gap':>6}  Experiment")
-        print("  " + "-" * 58)
-        prev_mtime = records[0]["mtime"] - 1
-        for r in records:
-            gap   = fmt_delta(r["mtime"] - prev_mtime)
-            exp   = next((e["name"] for e in reversed(exps)
-                          if e["mtime"] <= r["mtime"]), "?")
-            sign  = "-" if lower else "+"
-            delta = abs(baseline - r["cost"])
-            print(f"  {fmt_time(r['mtime']):>8}  {r['cost']:>9,}  "
-                  f"{sign}{delta:>8,}  {gap:>6}  {exp}")
-            prev_mtime = r["mtime"]
+    # Improvement history / plateau
+    if history:
+        print(f"\n  IMPROVEMENT HISTORY  "
+              f"plateau_score={plateau_score:.2f}  "
+              f"{plateau_bar(plateau_score)}  "
+              f"sensitivity={cfg['plateau_sensitivity']}")
+        print(f"  {'Time':>8}  {'Score':>9}  {'delta':>8}  {'rate/min':>9}")
+        print("  " + "-" * 44)
+        prev = None
+        for h in sorted(history, key=lambda x: x["ts"]):
+            delta  = f"-{prev-h['cost']:,}" if prev else "—"
+            dt     = (h["ts"] - history[sorted(range(len(history)),
+                      key=lambda i: history[i]["ts"])[max(0,
+                      sorted(range(len(history)),
+                      key=lambda i: history[i]["ts"]).index(
+                      next(i for i, x in enumerate(history) if x is h))-1)]]["ts"]
+                      if len(history) > 1 else 1)
+            print(f"  {fmt_time(h['ts']):>8}  {h['cost']:>9,}  {delta:>8}")
+            prev = h["cost"]
 
-    # Stall / running status
-    print()
+    # Record timeline from files
     if records:
-        last_ts    = records[-1]["mtime"]
-        mins_since = (now - last_ts) / 60
-        files_since = sum(1 for e in exps if e["mtime"] > last_ts)
-        stall_mins = cfg.get("stall_minutes", 15)
-        stall_files = cfg.get("stall_min_files", 3)
-        stalled = mins_since >= stall_mins and files_since >= stall_files
-
-        if stalled:
-            print(f"  ⚠  STALLED — {mins_since:.0f}m since last record, "
-                  f"{files_since} files written.")
-            if stop_signal.exists():
-                print(f"     STOP_SIGNAL present — explorer will halt soon.")
-            else:
-                print(f"     Run /optimize {problem_dir.name} to redirect.")
-        else:
-            print(f"  ✓  {mins_since:.1f}m since last record, "
-                  f"{files_since} new files.")
+        print(f"\n  RECORD FILES")
+        print(f"  {'Time':>8}  {'Score':>9}  {'Lane':>5}  {'vs base':>9}")
+        print("  " + "-" * 40)
+        for r in records[-10:]:
+            vs = f"-{abs(baseline-r['cost']):,}" if baseline else "—"
+            print(f"  {fmt_time(r['mtime']):>8}  {r['cost']:>9,}  "
+                  f"{'L'+str(r['lane']) if r['lane'] is not None else '—':>5}  {vs:>9}")
 
     # Recent experiments
     if exps:
-        print(f"\n  RECENT EXPERIMENTS")
-        for e in sorted(exps, key=lambda x: x["mtime"], reverse=True)[:5]:
-            print(f"  {fmt_time(e['mtime'])}  {e['name']:<36}"
+        print(f"\n  RECENT EXPERIMENTS (last 6)")
+        for e in sorted(exps, key=lambda x: x["mtime"], reverse=True)[:6]:
+            lane_tag = f"L{e['lane']}" if e["lane"] is not None else "  "
+            print(f"  {fmt_time(e['mtime'])}  [{lane_tag}] {e['name']:<36}"
                   f"  {e['size']/1024:>5.1f} KB  ({fmt_delta(now-e['mtime'])} ago)")
-        run = now - exps[0]["mtime"]
+        run  = now - exps[0]["mtime"]
         rate = len(exps) / run * 60 if run > 0 else 0
-        print(f"  {len(exps)} total  ·  {rate:.1f}/min  ·  "
-              f"elapsed {fmt_delta(run)}")
+        print(f"  {len(exps)} total  ·  {rate:.1f}/min  ·  elapsed {fmt_delta(run)}")
 
-    nxt = next((d for d in state["directions"] if d["status"] == "pending"), None)
-    print(f"\n  Next: {nxt['name'] if nxt else '(all directions exhausted)'}")
+    # Token budget
+    print(f"\n  TOKENS  {tokens_used:,} used / "
+          f"{f'{token_budget:,}' if token_budget else 'unlimited'}")
+
+    # Stall status
+    if records:
+        mins = (now - records[-1]["mtime"]) / 60
+        stall_mins  = cfg.get("stall_minutes", 15)
+        exps_since  = sum(1 for e in exps if e["mtime"] > records[-1]["mtime"])
+        stall_files = cfg.get("stall_min_files", 3)
+        stalled     = mins >= stall_mins and exps_since >= stall_files
+        print()
+        if stalled:
+            print(f"  ⚠  STALLED — {mins:.0f}m since last record, "
+                  f"{exps_since} files written. Run /optimize to redirect.")
+        elif plateau_score < cfg["plateau_sensitivity"]:
+            print(f"  📉 PLATEAU — score {plateau_score:.2f} < {cfg['plateau_sensitivity']}. "
+                  f"Manager will parallelize on next tick.")
+        else:
+            print(f"  ✓  {mins:.1f}m since last record.")
+
+    nxt = next((d for d in dirs if d["status"] == "pending"), None)
+    print(f"\n  Next pending: {nxt['name'] if nxt else '(none — all exhausted)'}")
     print()
-    print("=" * 68)
+    print("=" * 70)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("problem",   nargs="?", help="path to problem folder")
-    parser.add_argument("--root",    default=".", help="root for --list")
-    parser.add_argument("--list",    action="store_true")
-    parser.add_argument("--watch",   action="store_true")
+    parser.add_argument("problem",    nargs="?")
+    parser.add_argument("--root",     default=".")
+    parser.add_argument("--list",     action="store_true")
+    parser.add_argument("--watch",    action="store_true")
     parser.add_argument("--interval", type=int, default=10)
     args = parser.parse_args()
 
@@ -143,7 +239,7 @@ def main():
         root = Path(args.root).expanduser().resolve()
         for p in sorted(root.iterdir()):
             if p.is_dir() and (p / "problem.json").exists():
-                cfg = json.loads((p / "problem.json").read_text())
+                cfg = load_cfg(p)
                 print(f"  {p.name:<22} {cfg.get('description','')}")
         return
 
@@ -153,9 +249,10 @@ def main():
 
     problem_dir = resolve(args.problem)
     while True:
-        cfg, state = load(problem_dir)
-        records    = scan_records(problem_dir, cfg)
-        exps       = scan_experiments(problem_dir, cfg)
+        cfg     = load_cfg(problem_dir)
+        state   = load_state(problem_dir)
+        records = scan_records(problem_dir, cfg)
+        exps    = scan_experiments(problem_dir, cfg)
         render(problem_dir, cfg, state, records, exps)
         if not args.watch:
             break
