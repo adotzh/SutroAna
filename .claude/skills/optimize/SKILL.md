@@ -207,6 +207,14 @@ You are working in lane <lane_id>. Follow these rules exactly:
    ```
    Use an estimate of tokens consumed during that run.
 
+5. **Event logging**: Append structured events to `<problem>/events.jsonl` so
+   the user can follow progress in real time with `monitor.py --tail`:
+   - When you beat the record:
+     `{"ts": <unix_ts>, "type": "new_record", "cost": <cost>, "prev": <old>, "lane": <lane_id>, "file": "<filename>"}`
+   - When you start a new experiment variant:
+     `{"ts": <unix_ts>, "type": "exp_start", "lane": <lane_id>, "exp": "<filename>"}`
+   Append with `open(path, "a")` so concurrent lanes don't clobber each other.
+
 5. **Iterate**: Keep exploring variations within your direction until you get a
    STOP_SIGNAL or exhaust the search space.
 ```
@@ -226,3 +234,15 @@ You are working in lane <lane_id>. Follow these rules exactly:
    /schedule <next_wakeup_minutes>m /optimize <problem>
    ```
    (Use ScheduleWakeup tool with `delaySeconds = next_wakeup_minutes * 60`.)
+
+3. Remind the user how to observe progress:
+   ```
+   # Live event stream (recommended)
+   python3 <SutroAna>/monitor.py <problem> --tail
+
+   # Full dashboard
+   python3 <SutroAna>/monitor.py <problem> --watch
+
+   # One-liner for tmux status bar
+   python3 <SutroAna>/monitor.py <problem> --oneline
+   ```

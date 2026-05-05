@@ -106,6 +106,16 @@ def scan_experiments(problem_dir: Path, cfg: dict) -> list[dict]:
     return sorted(exps, key=lambda e: e["mtime"])
 
 
+# ─── event log ───────────────────────────────────────────────────────────────
+
+
+def append_event(problem_dir: Path, event: dict):
+    """Append one structured event to events.jsonl."""
+    event.setdefault("ts", time.time())
+    with open(problem_dir / "events.jsonl", "a") as f:
+        f.write(json.dumps(event) + "\n")
+
+
 # ─── token tracking ───────────────────────────────────────────────────────────
 
 
@@ -192,8 +202,9 @@ def is_lane_stalled(lane_id: int, lane_entry: dict, records: list[dict],
 # ─── state sync ───────────────────────────────────────────────────────────────
 
 
-def sync_improvement_history(state: dict, records: list[dict], lower_is_better: bool) -> dict:
-    """Add new best records to improvement_history."""
+def sync_improvement_history(problem_dir: Path, state: dict,
+                             records: list[dict], lower_is_better: bool) -> dict:
+    """Add new best records to improvement_history; emit new_record events."""
     history = state.setdefault("improvement_history", [])
     existing_ts = {h["ts"] for h in history}
     current_best = state.get("record")
@@ -210,9 +221,18 @@ def sync_improvement_history(state: dict, records: list[dict], lower_is_better: 
             is_best = cost > current_best
 
         if is_best:
+            prev = current_best
             current_best = cost
             history.append({"ts": r["mtime"], "cost": cost})
             existing_ts.add(r["mtime"])
+            append_event(problem_dir, {
+                "type": "new_record",
+                "ts": r["mtime"],
+                "cost": cost,
+                "prev": prev,
+                "lane": r["lane"],
+                "file": r["name"],
+            })
 
     state["record"] = current_best
     return state
@@ -227,7 +247,7 @@ def decide(problem_dir: Path, cfg: dict, state: dict) -> dict:
     lower = cfg["record_lower_is_better"]
 
     # 1. Sync improvement history
-    state = sync_improvement_history(state, records, lower)
+    state = sync_improvement_history(problem_dir, state, records, lower)
 
     # 2. Plateau detection
     is_plateau, plateau_score = compute_plateau(
@@ -255,16 +275,24 @@ def decide(problem_dir: Path, cfg: dict, state: dict) -> dict:
     for lane_entry in active_lanes:
         if is_lane_stalled(lane_entry["id"], lane_entry, records, exps, cfg):
             stalled_lane_ids.append(lane_entry["id"])
+            lane_recs = [r for r in records if r["lane"] == lane_entry["id"]]
+            last_rec_ts = max((r["mtime"] for r in lane_recs), default=lane_entry.get("started_at", time.time()))
+            mins = (time.time() - last_rec_ts) / 60
+            append_event(problem_dir, {"type": "stall", "lane_id": lane_entry["id"],
+                                       "minutes": round(mins, 1)})
+
+    if is_plateau:
+        append_event(problem_dir, {"type": "plateau", "score": plateau_score})
 
     # Emit stop + respawn for stalled lanes
     used_dir_ids = set()
     for lid in stalled_lane_ids:
         actions.append({"type": "stop_lane", "lane_id": lid})
+        append_event(problem_dir, {"type": "stop", "lane_id": lid, "reason": "stall"})
         if pending_dirs and not budget_exceeded:
             next_dir = next((d for d in pending_dirs if d["id"] not in used_dir_ids), None)
             if next_dir:
                 used_dir_ids.add(next_dir["id"])
-                # Find the lane entry
                 is_new = not any(l["id"] == lid for l in lanes)
                 actions.append({
                     "type": "spawn_agent",
@@ -272,6 +300,9 @@ def decide(problem_dir: Path, cfg: dict, state: dict) -> dict:
                     "direction_id": next_dir["id"],
                     "is_new_lane": is_new,
                 })
+                append_event(problem_dir, {"type": "spawn", "lane_id": lid,
+                                           "direction_id": next_dir["id"],
+                                           "direction_name": next_dir.get("name", next_dir["id"])})
 
     # 6. If plateau and room for more lanes and pending dirs
     current_active_count = len(active_lanes)
@@ -281,7 +312,6 @@ def decide(problem_dir: Path, cfg: dict, state: dict) -> dict:
         for next_dir in remaining_pending:
             if current_active_count >= max_lanes:
                 break
-            # Find unused lane id
             used_ids = {l["id"] for l in lanes}
             new_lane_id = next(i for i in range(max_lanes) if i not in used_ids)
             used_dir_ids.add(next_dir["id"])
@@ -291,6 +321,10 @@ def decide(problem_dir: Path, cfg: dict, state: dict) -> dict:
                 "direction_id": next_dir["id"],
                 "is_new_lane": True,
             })
+            append_event(problem_dir, {"type": "spawn", "lane_id": new_lane_id,
+                                       "direction_id": next_dir["id"],
+                                       "direction_name": next_dir.get("name", next_dir["id"]),
+                                       "reason": "plateau"})
             current_active_count += 1
 
     # 7. No active lanes at all — bootstrap lane 0
@@ -304,10 +338,15 @@ def decide(problem_dir: Path, cfg: dict, state: dict) -> dict:
                     "direction_id": next_dir["id"],
                     "is_new_lane": True,
                 })
+                append_event(problem_dir, {"type": "spawn", "lane_id": 0,
+                                           "direction_id": next_dir["id"],
+                                           "direction_name": next_dir.get("name", next_dir["id"]),
+                                           "reason": "bootstrap"})
 
     # 8. If no pending dirs and everything stalled → ideate
     if not pending_dirs and (all_done or not active_lanes or stalled_lane_ids):
         actions.append({"type": "ideate"})
+        append_event(problem_dir, {"type": "ideate"})
 
     # 9. Determine situation + next wakeup
     if not directions:
@@ -326,10 +365,9 @@ def decide(problem_dir: Path, cfg: dict, state: dict) -> dict:
         situation = "running"
         next_wakeup = cfg["manager_cadence_min"]
 
-    # Clamp wakeup
     next_wakeup = max(5, next_wakeup)
 
-    return {
+    result = {
         "actions": actions,
         "situation": situation,
         "next_wakeup_minutes": next_wakeup,
@@ -343,6 +381,11 @@ def decide(problem_dir: Path, cfg: dict, state: dict) -> dict:
             "token_budget": token_budget,
         },
     }
+    append_event(problem_dir, {"type": "tick", "situation": situation,
+                                "record": state.get("record"),
+                                "plateau_score": plateau_score,
+                                "next_wakeup_minutes": next_wakeup})
+    return result
 
 
 # ─── list problems ────────────────────────────────────────────────────────────
